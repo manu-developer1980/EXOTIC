@@ -47,7 +47,10 @@ from datetime import datetime
 import json
 import os
 import platform
-import python_version
+try:
+    import python_version
+except ImportError:
+    python_version = None  # optional dependency; degraded GUI mode still proceeds
 import subprocess
 import sys
 

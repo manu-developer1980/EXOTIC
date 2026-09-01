@@ -91,6 +91,230 @@ from photutils.aperture import CircularAperture
 import pandas as pd
 import re
 import requests
+# Portable sys.path injector: makes `import exotic_gpu.*` work regardless of cwd.
+# exotic_gpu/ lives in the EXOTIC/ directory, which is the grandparent of the current file:
+#   exotic/exotic.py  →  dirname() = exotic/  →  dirname() = EXOTIC/
+import os.path as _gpu_os_path_pinj
+import sys as _gpu_sys_pinj
+_gpu_curr_file = _gpu_os_path_pinj.abspath(__file__)
+_gpu_exotic_pkg_dir = _gpu_os_path_pinj.dirname(_gpu_curr_file)        # exotic/
+_gpu_exotic_repo_dir = _gpu_os_path_pinj.dirname(_gpu_exotic_pkg_dir)  # EXOTIC/  ← ahí está exotic_gpu/
+# Only add the repo dir if it exists and isn't already on sys.path:
+if _gpu_os_path_pinj.isdir(_gpu_exotic_repo_dir) and _gpu_exotic_repo_dir not in _gpu_sys_pinj.path:
+    _gpu_sys_pinj.path.insert(0, _gpu_exotic_repo_dir)
+del _gpu_os_path_pinj, _gpu_sys_pinj, _gpu_curr_file, _gpu_exotic_pkg_dir, _gpu_exotic_repo_dir
+
+# ============ EXOTIC GPU ACCELERATION INTEGRATION ============
+# Auto-detect and enable GPU acceleration if the exotic_gpu subpackage exists.
+# GPU/CPU dispatch and thresholds are scaled at runtime to the detected GPU tier
+# (VRAM-based proxy for CUDA core count / throughput); see
+# `alignment_gpu.get_gpu_tier() for the canonical tier definition.
+_EXOTIC_GPU_AVAILABLE = False
+_EXOTIC_GPU_ALIGN_BACKEND = "cpu"
+_EXOTIC_GPU_PHOT_BACKEND = "cpu"
+_EXOTIC_GPU_PSF_MOMENTS = None
+_EXOTIC_GPU_BATCH_APERTURE = None
+_EXOTIC_GPU_ALIGN_FUNC = None
+_EXOTIC_GPU_ALIGN_BATCH_FUNC = None
+_EXOTIC_GPU_USE_ALIGN_GPU = False
+_EXOTIC_GPU_USE_PHOT_GPU = False
+_EXOTIC_GPU_USE_PSF_MOMENTS = False
+_gpu_should_align = lambda *_: False
+_gpu_should_phot = lambda *_: False
+_gpu_tier_info = None  # populated later; used for the startup banner
+
+try:
+    import os as _os_gpu
+    _force_gpu = _os_gpu.environ.get("EXOTIC_ENABLE_GPU", "1") not in ("0", "false", "False", "no", "No")
+    if _force_gpu:
+        try:
+            from EXOTIC.exotic_gpu.alignment_gpu import (
+                phase_cross_correlation_gpu as _gpu_pcc,
+                should_use_gpu_for_alignment as _gpu_sa,
+                get_gpu_info as _gpu_align_info,
+                get_gpu_tier as _gpu_tier_fn,
+            )
+            _gpu_should_align = _gpu_sa
+            _align_info = _gpu_align_info()
+            try:
+                _gpu_tier_info = _gpu_tier_fn()
+            except Exception:
+                _gpu_tier_info = None
+            if _align_info["available"]:
+                _EXOTIC_GPU_AVAILABLE = True
+                _EXOTIC_GPU_ALIGN_BACKEND = _align_info["backend"]
+                _EXOTIC_GPU_ALIGN_FUNC = _gpu_pcc
+                _EXOTIC_GPU_USE_ALIGN_GPU = True
+            try:
+                from EXOTIC.exotic_gpu.alignment_gpu import (
+                    batch_phase_cross_correlation_gpu as _gpu_batch_pcc,
+                )
+                _EXOTIC_GPU_ALIGN_BATCH_FUNC = _gpu_batch_pcc
+            except Exception:
+                pass
+        except ImportError:
+            try:
+                from exotic_gpu.alignment_gpu import (
+                    phase_cross_correlation_gpu as _gpu_pcc2,
+                    should_use_gpu_for_alignment as _gpu_sa2,
+                    get_gpu_info as _gpu_align_info2,
+                    get_gpu_tier as _gpu_tier_fn2,
+                )
+                _gpu_should_align = _gpu_sa2
+                _align_info = _gpu_align_info2()
+                try:
+                    _gpu_tier_info = _gpu_tier_fn2()
+                except Exception:
+                    _gpu_tier_info = None
+                if _align_info["available"]:
+                    _EXOTIC_GPU_AVAILABLE = True
+                    _EXOTIC_GPU_ALIGN_BACKEND = _align_info["backend"]
+                    _EXOTIC_GPU_ALIGN_FUNC = _gpu_pcc2
+                    _EXOTIC_GPU_USE_ALIGN_GPU = True
+                try:
+                    from exotic_gpu.alignment_gpu import (
+                        batch_phase_cross_correlation_gpu as _gpu_batch_pcc2,
+                    )
+                    _EXOTIC_GPU_ALIGN_BATCH_FUNC = _gpu_batch_pcc2
+                except Exception:
+                    pass
+            except ImportError:
+                pass
+        except Exception:
+            pass
+
+        try:
+            from EXOTIC.exotic_gpu.photometry_gpu import (
+                compute_frame_aperture_grid_batch as _gpu_batch_phot,
+                should_use_gpu_photometry as _gpu_sp,
+                get_phot_gpu_backend as _gpu_phot_be,
+            )
+            _gpu_should_phot = _gpu_sp
+            _EXOTIC_GPU_PHOT_BACKEND = _gpu_phot_be()
+            if _EXOTIC_GPU_PHOT_BACKEND != "cpu":
+                _EXOTIC_GPU_USE_PHOT_GPU = True
+                _EXOTIC_GPU_AVAILABLE = True
+            _EXOTIC_GPU_BATCH_APERTURE = _gpu_batch_phot
+        except ImportError:
+            try:
+                from exotic_gpu.photometry_gpu import (
+                    compute_frame_aperture_grid_batch as _gpu_batch_phot2,
+                    should_use_gpu_photometry as _gpu_sp2,
+                    get_phot_gpu_backend as _gpu_phot_be2,
+                )
+                _gpu_should_phot = _gpu_sp2
+                _EXOTIC_GPU_PHOT_BACKEND = _gpu_phot_be2()
+                if _EXOTIC_GPU_PHOT_BACKEND != "cpu":
+                    _EXOTIC_GPU_USE_PHOT_GPU = True
+                    _EXOTIC_GPU_AVAILABLE = True
+                _EXOTIC_GPU_BATCH_APERTURE = _gpu_batch_phot2
+            except ImportError:
+                pass
+        except Exception:
+            pass
+
+        try:
+            from EXOTIC.exotic_gpu.psf_fitting_gpu import (
+                gaussian_psf_moments_cpu as _gpu_psf_mom,
+            )
+            _EXOTIC_GPU_PSF_MOMENTS = _gpu_psf_mom
+            _EXOTIC_GPU_USE_PSF_MOMENTS = True
+            _EXOTIC_GPU_AVAILABLE = True
+        except ImportError:
+            try:
+                from exotic_gpu.psf_fitting_gpu import (
+                    gaussian_psf_moments_cpu as _gpu_psf_mom2,
+                )
+                _EXOTIC_GPU_PSF_MOMENTS = _gpu_psf_mom2
+                _EXOTIC_GPU_USE_PSF_MOMENTS = True
+                _EXOTIC_GPU_AVAILABLE = True
+            except ImportError:
+                pass
+        except Exception:
+            pass
+
+    # Print one-shot startup banner so users always know where their GPU status.
+    try:
+        _env_gpu_banner_lines = []
+        _env_gpu_force_flag = ("ON" if _force_gpu else "OFF (EXOTIC_ENABLE_GPU=0)")
+        _env_gpu_banner_lines.append("")
+        _env_gpu_banner_lines.append("=" * 68)
+        _env_gpu_banner_lines.append(" EXOTIC GPU acceleration")
+        _env_gpu_banner_lines.append("=" * 68)
+        _env_gpu_banner_lines.append(f"  env EXOTIC_ENABLE_GPU : {_env_gpu_force_flag}")
+        if _EXOTIC_GPU_AVAILABLE:
+            _env_gpu_banner_lines.append(f"  align backend       : {_EXOTIC_GPU_ALIGN_BACKEND}")
+            _env_gpu_banner_lines.append(f"  phot  backend       : {_EXOTIC_GPU_PHOT_BACKEND}")
+            if _gpu_tier_info and _gpu_tier_info.get("tier") != "cpu":
+                _nm = _gpu_tier_info.get("name") or "(unknown)"
+                _tr = _gpu_tier_info.get("tier") or "?"
+                _mg = _gpu_tier_info.get("memory_gb", 0.0)
+                _bp = _gpu_tier_info.get("min_pixels_per_frame", 0)
+                _bs = _gpu_tier_info.get("recommended_batch_size", 0)
+                _env_gpu_banner_lines.append(f"  GPU name            : {_nm}")
+                _env_gpu_banner_lines.append(f"  GPU tier            : {_tr}  (VRAM {_mg:.2f} GB)")
+                _env_gpu_banner_lines.append(f"  align GPU threshold : {_bp:,} px/frame  (batch >= {_bs})")
+                if _EXOTIC_GPU_USE_ALIGN_GPU:
+                    _env_gpu_banner_lines.append("  alignment           : GPU-ready (dispatched per-frame via tier)")
+                else:
+                    _env_gpu_banner_lines.append("  alignment           : CPU-only")
+                if _EXOTIC_GPU_USE_PHOT_GPU:
+                    _env_gpu_banner_lines.append("  photometry          : GPU-ready (dispatched per-frame via tier)")
+                else:
+                    _env_gpu_banner_lines.append("  photometry          : CPU-only")
+            _env_gpu_banner_lines.append("  Result: GPU ACCELERATION ENABLED.")
+        else:
+            if not _force_gpu:
+                _env_gpu_banner_lines.append("  Reason: EXOTIC_ENABLE_GPU=0 in environment.")
+            else:
+                if _gpu_tier_info and _gpu_tier_info.get("tier") == "cpu":
+                    _env_gpu_banner_lines.append("  align backend       : cpu (no CUDA GPU detected)")
+                else:
+                    _env_gpu_banner_lines.append(f"  align backend       : {_EXOTIC_GPU_ALIGN_BACKEND}")
+                _env_gpu_banner_lines.append("  phot  backend       : cpu")
+                _env_gpu_banner_lines.append("  Reason: no CUDA-capable GPU or no torch/cupy/numba backends available.")
+            _env_gpu_banner_lines.append("  Result: running on CPU (graceful fallback).")
+        _env_gpu_banner_lines.append("=" * 68)
+        try:
+            print("\n".join(_env_gpu_banner_lines), flush=True)
+        except Exception:
+            pass
+    except Exception:
+        pass  # never let the banner break startup
+
+    del _force_gpu
+    del _os_gpu
+
+    def phase_cross_correlation(moving, reference, upsample_factor=1, *args, **kwargs):
+        """GPU-accelerated phase_cross_correlation with smart dispatch.
+
+        Keeps the exact same public signature as skimage.registration.phase_cross_correlation:
+            shift (np.ndarray) and pixel error.
+        """
+        global _EXOTIC_GPU_ALIGN_FUNC
+        try:
+            if _EXOTIC_GPU_USE_ALIGN_GPU and _EXOTIC_GPU_ALIGN_FUNC is not None:
+                _shape = getattr(moving, "shape", None)
+                if _shape is not None and len(_shape) == 2 and _gpu_should_align(_shape):
+                    _res = _EXOTIC_GPU_ALIGN_FUNC(
+                        moving, reference,
+                        upsample_factor=upsample_factor,
+                        return_error=True,
+                    )
+                    if isinstance(_res, tuple) and len(_res) >= 2:
+                        _shift, _err = _res[0], _res[1]
+                        return (np.asarray(_shift, dtype=float),
+                                float(_err) if np.isfinite(_err) else 0.0,
+                                np.nan)
+        except Exception:
+            pass
+        return _skimage_phase_cross_correlation(moving, reference, upsample_factor=upsample_factor, *args, **kwargs)
+
+except Exception:
+    def phase_cross_correlation(moving, reference, upsample_factor=1, *args, **kwargs):
+        return _skimage_phase_cross_correlation(moving, reference, upsample_factor=upsample_factor, *args, **kwargs)
+# ============ END EXOTIC GPU ACCELERATION INTEGRATION ============
+
 # scipy imports
 from scipy.optimize import least_squares
 from scipy.stats import mode
