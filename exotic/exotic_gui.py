@@ -126,15 +126,19 @@ class FileSelect(tk.Frame):
 
 
 def main():
-    try:
-        python_version.check(min=(3, 8, 0), max=(4, 0, 0))
-    except Exception as e:
-        print(f"\nERROR: EXOTIC {str(e)}. ... EXITING!\n")
-        print("Press the <ENTER> key to continue. ...")
-        sys.stdin.read(1)
-        exit(65)  # package is not installed
+    if python_version is not None:
+        try:
+            python_version.check(min=(3, 8, 0), max=(4, 0, 0))
+        except Exception as e:
+            print(f"\nERROR: EXOTIC {str(e)}. ... EXITING!\n")
+            print("Press the <ENTER> key to continue. ...")
+            sys.stdin.read(1)
+            exit(65)  # package is not installed
+        else:
+            print(f"\nSUCCESS: Valid Python version {platform.python_version()} detected!\n")
     else:
-        print(f"\nSUCCESS: Valid Python version {platform.python_version()} detected!\n")
+        print(f"\nINFO: python_version package not installed — skipping version check.")
+        print(f"      Running on Python {platform.python_version()}.\n")
 
     root=tk.Tk() 
     root.protocol("WM_DELETE_WINDOW", exit)
