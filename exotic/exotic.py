@@ -109,6 +109,10 @@ del _gpu_os_path_pinj, _gpu_sys_pinj, _gpu_curr_file, _gpu_exotic_pkg_dir, _gpu_
 # GPU/CPU dispatch and thresholds are scaled at runtime to the detected GPU tier
 # (VRAM-based proxy for CUDA core count / throughput); see
 # `alignment_gpu.get_gpu_tier() for the canonical tier definition.
+#
+# The skimage reference is captured here unconditionally so the CPU fallback path is
+# always defined even when EXOTIC_ENABLE_GPU=0 (NameError otherwise).
+from skimage.registration import phase_cross_correlation as _skimage_phase_cross_correlation
 _EXOTIC_GPU_AVAILABLE = False
 _EXOTIC_GPU_ALIGN_BACKEND = "cpu"
 _EXOTIC_GPU_PHOT_BACKEND = "cpu"
@@ -285,34 +289,37 @@ try:
     del _force_gpu
     del _os_gpu
 
-    def phase_cross_correlation(moving, reference, upsample_factor=1, *args, **kwargs):
-        """GPU-accelerated phase_cross_correlation with smart dispatch.
-
-        Keeps the exact same public signature as skimage.registration.phase_cross_correlation:
-            shift (np.ndarray) and pixel error.
-        """
-        global _EXOTIC_GPU_ALIGN_FUNC
-        try:
-            if _EXOTIC_GPU_USE_ALIGN_GPU and _EXOTIC_GPU_ALIGN_FUNC is not None:
-                _shape = getattr(moving, "shape", None)
-                if _shape is not None and len(_shape) == 2 and _gpu_should_align(_shape):
-                    _res = _EXOTIC_GPU_ALIGN_FUNC(
-                        moving, reference,
-                        upsample_factor=upsample_factor,
-                        return_error=True,
-                    )
-                    if isinstance(_res, tuple) and len(_res) >= 2:
-                        _shift, _err = _res[0], _res[1]
-                        return (np.asarray(_shift, dtype=float),
-                                float(_err) if np.isfinite(_err) else 0.0,
-                                np.nan)
-        except Exception:
-            pass
-        return _skimage_phase_cross_correlation(moving, reference, upsample_factor=upsample_factor, *args, **kwargs)
-
 except Exception:
-    def phase_cross_correlation(moving, reference, upsample_factor=1, *args, **kwargs):
-        return _skimage_phase_cross_correlation(moving, reference, upsample_factor=upsample_factor, *args, **kwargs)
+    # If anything in the GPU bootstrap block fails (missing exotic_gpu, broken
+    # CUDA, a skimage API change, etc.), we just silently fall through to the
+    # plain CPU implementation defined below — no startup noise.
+    pass
+
+def phase_cross_correlation(moving, reference, upsample_factor=1, *args, **kwargs):
+    """GPU-accelerated phase_cross_correlation with smart dispatch.
+
+    Keeps the exact same public signature as skimage.registration.phase_cross_correlation:
+        shift (np.ndarray) and pixel error.
+    """
+    global _EXOTIC_GPU_ALIGN_FUNC
+    try:
+        if _EXOTIC_GPU_USE_ALIGN_GPU and _EXOTIC_GPU_ALIGN_FUNC is not None:
+            _shape = getattr(moving, "shape", None)
+            if _shape is not None and len(_shape) == 2 and _gpu_should_align(_shape):
+                _res = _EXOTIC_GPU_ALIGN_FUNC(
+                    moving, reference,
+                    upsample_factor=upsample_factor,
+                    return_error=True,
+                )
+                if isinstance(_res, tuple) and len(_res) >= 2:
+                    _shift, _err = _res[0], _res[1]
+                    return (np.asarray(_shift, dtype=float),
+                            float(_err) if np.isfinite(_err) else 0.0,
+                            np.nan)
+    except Exception:
+        pass
+    return _skimage_phase_cross_correlation(moving, reference, upsample_factor=upsample_factor, *args, **kwargs)
+
 # ============ END EXOTIC GPU ACCELERATION INTEGRATION ============
 
 # scipy imports
