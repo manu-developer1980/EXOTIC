@@ -369,23 +369,23 @@ def _probe_gpu_tier() -> Dict[str, Any]:
     #   extreme : > 24 GB  — data-centre / big-FP  (A100, H100, 4090, 6000 Ada)
     if mem_gb < 6.0:
         tier_name = "low"
-        min_pixels = 250_000
-        min_stack = 96
+        min_pixels = 65_536
+        min_stack = 16
         batch = 8
     elif mem_gb < 11.0:
         tier_name = "mid"
-        min_pixels = 80_000
-        min_stack = 48
+        min_pixels = 16_384
+        min_stack = 8
         batch = 16
     elif mem_gb <= 24.0:
         tier_name = "high"
-        min_pixels = 40_000
-        min_stack = 20
+        min_pixels = 8_192
+        min_stack = 4
         batch = 32
     else:
         tier_name = "extreme"
-        min_pixels = 20_000
-        min_stack = 8
+        min_pixels = 4_096
+        min_stack = 2
         batch = 64
 
     tier.update(
