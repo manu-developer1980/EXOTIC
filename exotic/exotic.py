@@ -2014,6 +2014,80 @@ def fit_lightcurve(times, tFlux, cFlux, airmass, ld, pDict, jd_times=None):
     return myfit, f1, f2
 
 
+def _eval_aperture_candidate_worker(task):
+    """
+    Multiprocessing worker to evaluate one (aper, annulus) candidate in parallel.
+    Fits both without comp star and against all comparison stars.
+    """
+    (
+        a, aper, an, annulus, tFlux, comp_fluxes,
+        times, airmass, ld, pDict, jd_times, vsp_num, comp_coords
+    ) = task
+
+    temp_ref_flux = {i: None for i in vsp_num}
+    candidates = []
+
+    # 1. Fit without a comparison star
+    try:
+        myfit_nc, tFlux1_nc, cFlux1_nc = fit_lightcurve(
+            times, tFlux, np.ones(tFlux.shape[0]), airmass, ld, pDict, jd_times
+        )
+        if myfit_nc is not None:
+            res_std_nc = float(myfit_nc.residuals.std() / np.median(myfit_nc.data))
+            if np.isfinite(res_std_nc):
+                candidates.append({
+                    'res_std': res_std_nc,
+                    'myfit': myfit_nc,
+                    'comp_star_num': None,
+                    'comp_star_coords': None,
+                    'min_aperture': -float(aper),
+                    'min_annulus': float(annulus),
+                    'flux_tar': tFlux1_nc,
+                    'flux_ref': cFlux1_nc,
+                    'ckey': None,
+                    'comp_idx': None,
+                })
+    except Exception:
+        pass
+
+    # 2. Fit with each comparison star
+    for j, cFlux_raw in enumerate(comp_fluxes):
+        ckey = f"comp{j + 1}"
+        aper_mask = np.isfinite(cFlux_raw)
+        if not np.any(aper_mask):
+            continue
+        cFlux = cFlux_raw[aper_mask]
+        try:
+            myfit_c, tFlux1_c, cFlux1_c = fit_lightcurve(
+                times[aper_mask], tFlux[aper_mask], cFlux,
+                airmass[aper_mask], ld, pDict, jd_times[aper_mask]
+            )
+            if myfit_c is not None:
+                if j in vsp_num:
+                    temp_ref_flux[j] = {
+                        'myfit': myfit_c,
+                        'pos': comp_coords[j]
+                    }
+                res_std_c = float(myfit_c.residuals.std() / np.median(myfit_c.data))
+                if np.isfinite(res_std_c):
+                    candidates.append({
+                        'res_std': res_std_c,
+                        'myfit': myfit_c,
+                        'comp_star_num': j + 1,
+                        'comp_star_coords': comp_coords[j],
+                        'min_aperture': float(aper),
+                        'min_annulus': float(annulus),
+                        'flux_tar': tFlux1_c,
+                        'flux_ref': cFlux1_c,
+                        'ckey': ckey,
+                        'comp_idx': j,
+                    })
+        except Exception:
+            pass
+
+    return candidates, temp_ref_flux
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Using a JSON initialization file to bypass user inputs for EXOTIC.")
     parser.add_argument('-rt', '--realtime',
@@ -2612,55 +2686,89 @@ def main():
                         'pos': exotic_infoDict['comp_stars'][j]
                     }
 
-            log_info("\nComputing best comparison star, aperture, and sky annulus. Please wait.")
+            n_cpu = os.cpu_count() or 4
+            n_workers = max(1, min(n_cpu - 1, 16)) if n_cpu > 1 else 1
+            log_info(f"\nComputing best comparison star, aperture, and sky annulus (using {n_workers} CPU cores). Please wait.")
 
-            # Aperture Photometry
-            for a, aper in enumerate(apers):
-                for an, annulus in enumerate(annuli):
-                    tFlux = aper_data['target'][:, a, an]
-                    ref_flux_opt, ref_flux_opt2, backtrack = False, False, True
-                    temp_ref_flux = {i: None for i in vsp_num}
+            comp_coords = exotic_infoDict['comp_stars']
+            n_comps = len(comp_coords)
+            mp_success = False
 
-                    # fit without a comparison star
-                    myfit, tFlux1, cFlux1 = fit_lightcurve(times, tFlux, np.ones(tFlux.shape[0]), airmass, ld, pDict, jd_times)
+            if n_workers > 1:
+                try:
+                    import concurrent.futures
+                    import multiprocessing
+                    ctx = multiprocessing.get_context('fork') if hasattr(multiprocessing, 'get_context') and os.name != 'nt' else None
 
-                    if myfit is not None:
-                        for k in myfit.bounds.keys():
-                            log.debug(f"  {k}: {myfit.parameters[k]:.6f}")
+                    tasks = []
+                    for a, aper in enumerate(apers):
+                        for an, annulus in enumerate(annuli):
+                            tFlux = aper_data['target'][:, a, an]
+                            comp_fluxes = [aper_data[f"comp{j + 1}"][:, a, an] for j in range(n_comps)]
+                            tasks.append((
+                                a, aper, an, annulus, tFlux, comp_fluxes,
+                                times, airmass, ld, pDict, jd_times, vsp_num, comp_coords
+                            ))
 
-                        log.debug("The Residual Standard Deviation is: "
-                                f"{round(100 * myfit.residuals.std() / np.median(myfit.data), 6)}%")
-                        log.debug(f"The Mean Squared Error is: {round(np.sum(myfit.residuals ** 2), 6)}\n")
+                    with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
+                        results = list(executor.map(_eval_aperture_candidate_worker, tasks))
 
-                        res_std = myfit.residuals.std() / np.median(myfit.data)
-                    if photometry_info['min_std'] > res_std and myfit is not None:
-                        ref_flux_opt = True
+                    for candidates, temp_ref in results:
+                        for cand in candidates:
+                            if cand['res_std'] < photometry_info['min_std']:
+                                photometry_info.update(
+                                    best_fit_lc=copy.deepcopy(cand['myfit']),
+                                    comp_star_num=cand['comp_star_num'],
+                                    comp_star_coords=cand['comp_star_coords'],
+                                    min_std=cand['res_std'],
+                                    min_aperture=cand['min_aperture'],
+                                    min_annulus=cand['min_annulus']
+                                )
+                                flux_values.update(
+                                    flux_tar=cand['flux_tar'],
+                                    flux_ref=cand['flux_ref'],
+                                    flux_unc_tar=cand['flux_tar'] ** 0.5,
+                                    flux_unc_ref=cand['flux_ref'] ** 0.5
+                                )
+                                ckey = cand['ckey']
+                                if ckey is not None and ckey in psf_data:
+                                    x_ref = psf_data[ckey][:, 0]
+                                    y_ref = psf_data[ckey][:, 1]
+                                else:
+                                    x_ref = None
+                                    y_ref = None
+                                centroid_positions.update(
+                                    x_targ=psf_data["target"][:, 0],
+                                    y_targ=psf_data["target"][:, 1],
+                                    x_ref=x_ref,
+                                    y_ref=y_ref
+                                )
+                                if cand['comp_idx'] is not None and cand['comp_idx'] in vsp_num:
+                                    ref_flux[cand['comp_idx']] = {
+                                        'myfit': copy.deepcopy(cand['myfit']),
+                                        'pos': cand['comp_star_coords']
+                                    }
+                                for v_idx, v_val in temp_ref.items():
+                                    if v_val is not None and v_idx != cand['comp_idx']:
+                                        ref_flux[v_idx] = copy.deepcopy(v_val)
 
-                        photometry_info.update(best_fit_lc=copy.deepcopy(myfit),
-                                               comp_star_num=None, comp_star_coords=None,
-                                               min_std=res_std, min_aperture=-aper, min_annulus=annulus)
+                    mp_success = True
+                except Exception as _e_mp:
+                    log.debug(f"Multiprocessing grid search failed ({_e_mp}), falling back to single-thread.")
+                    mp_success = False
 
-                        flux_values.update(flux_tar=tFlux1, flux_ref=cFlux1,
-                                           flux_unc_tar=tFlux1 ** 0.5, flux_unc_ref=cFlux1 ** 0.5)
+            if not mp_success:
+                # Aperture Photometry (Sequential fallback)
+                for a, aper in enumerate(apers):
+                    for an, annulus in enumerate(annuli):
+                        tFlux = aper_data['target'][:, a, an]
+                        ref_flux_opt, ref_flux_opt2, backtrack = False, False, True
+                        temp_ref_flux = {i: None for i in vsp_num}
 
-                        centroid_positions.update(x_targ=psf_data["target"][:, 0], y_targ=psf_data["target"][:, 1],
-                                                  x_ref=psf_data[ckey][:, 0], y_ref=psf_data[ckey][:, 1])
-
-                    # try to fit data with comp star
-                    for j in range(len(exotic_infoDict['comp_stars'])):
-                        ckey = f"comp{j + 1}"
-                        aper_mask = np.isfinite(aper_data[ckey][:, a, an])
-                        cFlux = aper_data[ckey][aper_mask][:, a, an]
-
-                        myfit, tFlux1, cFlux1 = fit_lightcurve(times[aper_mask], tFlux[aper_mask], cFlux, airmass[aper_mask], ld, pDict, jd_times[aper_mask])
+                        # fit without a comparison star
+                        myfit, tFlux1, cFlux1 = fit_lightcurve(times, tFlux, np.ones(tFlux.shape[0]), airmass, ld, pDict, jd_times)
 
                         if myfit is not None:
-                            if j in vsp_num:
-                                temp_ref_flux[j] = {
-                                    'myfit': copy.deepcopy(myfit),
-                                    'pos': exotic_infoDict['comp_stars'][j]
-                                }
-
                             for k in myfit.bounds.keys():
                                 log.debug(f"  {k}: {myfit.parameters[k]:.6f}")
 
@@ -2669,13 +2777,12 @@ def main():
                             log.debug(f"The Mean Squared Error is: {round(np.sum(myfit.residuals ** 2), 6)}\n")
 
                             res_std = myfit.residuals.std() / np.median(myfit.data)
-                        if photometry_info['min_std'] > res_std and myfit is not None:  # If the standard deviation is less than the previous min
-                            ref_flux_opt2 = True
+                        if photometry_info['min_std'] > res_std and myfit is not None:
+                            ref_flux_opt = True
 
                             photometry_info.update(best_fit_lc=copy.deepcopy(myfit),
-                                                   comp_star_num=j + 1,
-                                                   comp_star_coords=exotic_infoDict['comp_stars'][j],
-                                                   min_std=res_std, min_aperture=aper, min_annulus=annulus)
+                                                   comp_star_num=None, comp_star_coords=None,
+                                                   min_std=res_std, min_aperture=-aper, min_annulus=annulus)
 
                             flux_values.update(flux_tar=tFlux1, flux_ref=cFlux1,
                                                flux_unc_tar=tFlux1 ** 0.5, flux_unc_ref=cFlux1 ** 0.5)
@@ -2683,18 +2790,55 @@ def main():
                             centroid_positions.update(x_targ=psf_data["target"][:, 0], y_targ=psf_data["target"][:, 1],
                                                       x_ref=psf_data[ckey][:, 0], y_ref=psf_data[ckey][:, 1])
 
-                        if ref_flux_opt or ref_flux_opt2:
-                            if j in vsp_num:
-                                ref_flux[j] = {
-                                    'myfit': copy.deepcopy(myfit),
-                                    'pos': exotic_infoDict['comp_stars'][j]
-                                }
+                        # try to fit data with comp star
+                        for j in range(len(exotic_infoDict['comp_stars'])):
+                            ckey = f"comp{j + 1}"
+                            aper_mask = np.isfinite(aper_data[ckey][:, a, an])
+                            cFlux = aper_data[ckey][aper_mask][:, a, an]
 
-                            if backtrack:
-                                for i, value in enumerate(temp_ref_flux.values()):
-                                    if value is not None and i != j:
-                                        ref_flux[i] = value
-                                backtrack = False
+                            myfit, tFlux1, cFlux1 = fit_lightcurve(times[aper_mask], tFlux[aper_mask], cFlux, airmass[aper_mask], ld, pDict, jd_times[aper_mask])
+
+                            if myfit is not None:
+                                if j in vsp_num:
+                                    temp_ref_flux[j] = {
+                                        'myfit': copy.deepcopy(myfit),
+                                        'pos': exotic_infoDict['comp_stars'][j]
+                                    }
+
+                                for k in myfit.bounds.keys():
+                                    log.debug(f"  {k}: {myfit.parameters[k]:.6f}")
+
+                                log.debug("The Residual Standard Deviation is: "
+                                        f"{round(100 * myfit.residuals.std() / np.median(myfit.data), 6)}%")
+                                log.debug(f"The Mean Squared Error is: {round(np.sum(myfit.residuals ** 2), 6)}\n")
+
+                                res_std = myfit.residuals.std() / np.median(myfit.data)
+                            if photometry_info['min_std'] > res_std and myfit is not None:  # If the standard deviation is less than the previous min
+                                ref_flux_opt2 = True
+
+                                photometry_info.update(best_fit_lc=copy.deepcopy(myfit),
+                                                       comp_star_num=j + 1,
+                                                       comp_star_coords=exotic_infoDict['comp_stars'][j],
+                                                       min_std=res_std, min_aperture=aper, min_annulus=annulus)
+
+                                flux_values.update(flux_tar=tFlux1, flux_ref=cFlux1,
+                                                   flux_unc_tar=tFlux1 ** 0.5, flux_unc_ref=cFlux1 ** 0.5)
+
+                                centroid_positions.update(x_targ=psf_data["target"][:, 0], y_targ=psf_data["target"][:, 1],
+                                                          x_ref=psf_data[ckey][:, 0], y_ref=psf_data[ckey][:, 1])
+
+                            if ref_flux_opt or ref_flux_opt2:
+                                if j in vsp_num:
+                                    ref_flux[j] = {
+                                        'myfit': copy.deepcopy(myfit),
+                                        'pos': exotic_infoDict['comp_stars'][j]
+                                    }
+
+                                if backtrack:
+                                    for i, value in enumerate(temp_ref_flux.values()):
+                                        if value is not None and i != j:
+                                            ref_flux[i] = value
+                                    backtrack = False
 
             log_info("\n\n*********************************************")
             if photometry_info['min_aperture'] == 0:  # psf
