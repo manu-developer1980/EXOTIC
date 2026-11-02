@@ -2473,26 +2473,47 @@ def main():
                     apers *= sigma
                     annuli *= sigma
 
-                for a, aper in enumerate(apers):
-                    for an, annulus in enumerate(annuli):
-                        if not np.isnan(psf_data['target'][i, 0]):
-                            aper_data["target"][i][a][an], aper_data["target_bg"][i][a][an] = aperPhot(imageData, 0,
-                                                                                                        psf_data['target'][i, 0],
-                                                                                                        psf_data['target'][i, 1],
-                                                                                                        aper, annulus)
-                        else:
-                            aper_data["target"][i][a][an] = np.nan
-                            aper_data["target_bg"][i][a][an] = np.nan
-                        # loop through comp stars
+                _used_gpu_phot = False
+                if _EXOTIC_GPU_USE_PHOT_GPU and _EXOTIC_GPU_BATCH_APERTURE is not None:
+                    try:
+                        star_coords = [(psf_data['target'][i, 0], psf_data['target'][i, 1])]
                         for j in range(len(exotic_infoDict['comp_stars'])):
                             ckey = f"comp{j + 1}"
-                            if not np.isnan(psf_data[ckey][i][0]):
-                                aper_data[ckey][i][a][an], \
-                                aper_data[f"{ckey}_bg"][i][a][an] = aperPhot(imageData, j + 1, psf_data[ckey][i, 0],
-                                                                            psf_data[ckey][i, 1], aper, annulus)
+                            star_coords.append((psf_data[ckey][i, 0], psf_data[ckey][i, 1]))
+                        batch_res = _EXOTIC_GPU_BATCH_APERTURE(imageData, star_coords, apers, annuli)
+                        if batch_res is not None and len(batch_res) == len(star_coords):
+                            aper_data["target"][i] = batch_res[0][0]
+                            aper_data["target_bg"][i] = batch_res[0][1]
+                            for j in range(len(exotic_infoDict['comp_stars'])):
+                                ckey = f"comp{j + 1}"
+                                aper_data[ckey][i] = batch_res[j + 1][0]
+                                aper_data[f"{ckey}_bg"][i] = batch_res[j + 1][1]
+                            _used_gpu_phot = True
+                    except Exception as _e_phot:
+                        log.debug(f"GPU batch aperture photometry failed on frame {i}: {_e_phot}")
+                        _used_gpu_phot = False
+
+                if not _used_gpu_phot:
+                    for a, aper in enumerate(apers):
+                        for an, annulus in enumerate(annuli):
+                            if not np.isnan(psf_data['target'][i, 0]):
+                                aper_data["target"][i][a][an], aper_data["target_bg"][i][a][an] = aperPhot(imageData, 0,
+                                                                                                            psf_data['target'][i, 0],
+                                                                                                            psf_data['target'][i, 1],
+                                                                                                            aper, annulus)
                             else:
-                                aper_data[ckey][i][a][an] = np.nan
-                                aper_data[f"{ckey}_bg"][i][a][an] = np.nan
+                                aper_data["target"][i][a][an] = np.nan
+                                aper_data["target_bg"][i][a][an] = np.nan
+                            # loop through comp stars
+                            for j in range(len(exotic_infoDict['comp_stars'])):
+                                ckey = f"comp{j + 1}"
+                                if not np.isnan(psf_data[ckey][i][0]):
+                                    aper_data[ckey][i][a][an], \
+                                    aper_data[f"{ckey}_bg"][i][a][an] = aperPhot(imageData, j + 1, psf_data[ckey][i, 0],
+                                                                                psf_data[ckey][i, 1], aper, annulus)
+                                else:
+                                    aper_data[ckey][i][a][an] = np.nan
+                                    aper_data[f"{ckey}_bg"][i][a][an] = np.nan
 
                 # close file + delete from memory
                 hdul.close()

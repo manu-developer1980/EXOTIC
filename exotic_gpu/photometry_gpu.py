@@ -152,7 +152,9 @@ def should_use_gpu_photometry(
     except Exception:
         pixels = 0
     total_work = int(n_stars or 0) * int(n_apertures or 0)
-    return total_work >= tier["min_work"] and pixels >= tier["min_pixels_per_frame"]
+    min_work = tier.get("min_work", 15)
+    min_pixels = tier.get("min_pixels_per_frame", 16_384)
+    return total_work >= min_work and pixels >= min_pixels
 
 
 def _finite_float(x):
@@ -304,79 +306,62 @@ def _batch_phot_pytorch(
     n_stars = len(star_coords)
     na, nn = len(apertures), len(annuli)
 
-    valid_mask = np.ones(n_stars, dtype=bool)
-    xs = np.zeros(n_stars, dtype=np.float32)
-    ys = np.zeros(n_stars, dtype=np.float32)
-    for i, (xc, yc) in enumerate(star_coords):
+    aps_np = np.asarray(apertures, dtype=np.float32).reshape(-1)
+    anns_np = np.asarray(annuli, dtype=np.float32).reshape(-1)
+    r_max = float(np.nanmax(aps_np) + np.nanmax(anns_np) + 3.0)
+
+    img_t = torch.from_numpy(data).to(_PHOT_DEVICE)
+    aps_t = torch.from_numpy(aps_np).to(_PHOT_DEVICE).view(-1, 1, 1)
+    anns_t = torch.from_numpy(anns_np).to(_PHOT_DEVICE).view(1, -1, 1, 1)
+
+    results: List[Tuple[np.ndarray, np.ndarray]] = []
+    nan_val = torch.tensor(float('nan'), device=_PHOT_DEVICE)
+
+    for xc, yc in star_coords:
         xcf, ycf = _finite_float(xc), _finite_float(yc)
         if xcf is None or ycf is None:
-            valid_mask[i] = False
-            continue
-        xs[i], ys[i] = xcf, ycf
-
-    xs_t = torch.from_numpy(xs[valid_mask]).to(_PHOT_DEVICE)
-    ys_t = torch.from_numpy(ys[valid_mask]).to(_PHOT_DEVICE)
-    img_t = torch.from_numpy(data).to(_PHOT_DEVICE)
-    aps_t = torch.from_numpy(apertures.astype(np.float32)).to(_PHOT_DEVICE)
-    anns_t = torch.from_numpy(annuli.astype(np.float32)).to(_PHOT_DEVICE)
-
-    nv = int(valid_mask.sum())
-    flux_grids_gpu = torch.full((nv, na, nn), torch.nan, device=_PHOT_DEVICE)
-    bg_grids_gpu = torch.full((nv, na, nn), torch.nan, device=_PHOT_DEVICE)
-
-    yh, xh = torch.meshgrid(
-        torch.arange(h, device=_PHOT_DEVICE, dtype=torch.float32),
-        torch.arange(w, device=_PHOT_DEVICE, dtype=torch.float32),
-        indexing="ij",
-    )
-
-    for si in range(nv):
-        xc_s = xs_t[si]
-        yc_s = ys_t[si]
-        for ai in range(na):
-            ap_r = aps_t[ai]
-            if not torch.isfinite(ap_r) or ap_r <= 0:
-                continue
-            r2 = (xh - xc_s) ** 2 + (yh - yc_s) ** 2
-            ap_mask = r2 <= ap_r * ap_r
-            finite_mask = torch.isfinite(img_t)
-            valid_mask_ap = ap_mask & finite_mask
-            mask_area = valid_mask_ap.sum().float()
-            if mask_area == 0:
-                continue
-            raw_sum = (img_t * valid_mask_ap.float()).sum()
-            for ni in range(nn):
-                ann_w = anns_t[ni]
-                if not torch.isfinite(ann_w):
-                    continue
-                if ann_w > 0:
-                    outer_r = ap_r + ann_w
-                    ann_mask = (r2 >= ap_r * ap_r) & (r2 <= outer_r * outer_r)
-                    valid_ann = ann_mask & finite_mask
-                    vals = img_t[valid_ann]
-                    if vals.numel() == 0:
-                        continue
-                    bg = torch.median(vals)
-                    bg_grids_gpu[si, ai, ni] = bg
-                    flux_grids_gpu[si, ai, ni] = raw_sum - bg * mask_area
-                else:
-                    bg_grids_gpu[si, ai, ni] = 0.0
-                    flux_grids_gpu[si, ai, ni] = raw_sum
-
-    flux_out_cpu = flux_grids_gpu.detach().cpu().numpy()
-    bg_out_cpu = bg_grids_gpu.detach().cpu().numpy()
-
-    del data, xs_t, ys_t, img_t, aps_t, anns_t, flux_grids_gpu, bg_grids_gpu, yh, xh
-    torch.cuda.empty_cache()
-
-    results = []
-    vi = 0
-    for i in range(n_stars):
-        if valid_mask[i]:
-            results.append((flux_out_cpu[vi].copy(), bg_out_cpu[vi].copy()))
-            vi += 1
-        else:
             results.append((np.full((na, nn), np.nan), np.full((na, nn), np.nan)))
+            continue
+
+        x0 = max(0, int(np.floor(xcf - r_max)))
+        x1 = min(w, int(np.ceil(xcf + r_max)) + 1)
+        y0 = max(0, int(np.floor(ycf - r_max)))
+        y1 = min(h, int(np.ceil(ycf + r_max)) + 1)
+
+        if x1 <= x0 or y1 <= y0:
+            results.append((np.full((na, nn), np.nan), np.full((na, nn), np.nan)))
+            continue
+
+        cutout = img_t[y0:y1, x0:x1]
+        yh = torch.arange(y0, y1, device=_PHOT_DEVICE, dtype=torch.float32).unsqueeze(1)
+        xh = torch.arange(x0, x1, device=_PHOT_DEVICE, dtype=torch.float32).unsqueeze(0)
+
+        r2 = ((xh - xcf)**2 + (yh - ycf)**2).unsqueeze(0)  # (1, ch, cw)
+        finite_mask = torch.isfinite(cutout).unsqueeze(0)
+
+        # Aperture masks and sums: (na, ch, cw)
+        ap_masks = (r2 <= (aps_t ** 2)) & finite_mask
+        mask_areas = ap_masks.sum(dim=(1, 2)).float()  # (na,)
+        raw_sums = (cutout.unsqueeze(0) * ap_masks.float()).sum(dim=(1, 2))  # (na,)
+
+        # Annulus masks: (na, nn, ch, cw)
+        # Note: EXOTIC uses a 2-pixel gap between aperture and sky annulus (r + 2)
+        in_r = aps_t.unsqueeze(1) + 2.0   # (na, 1, 1, 1)
+        out_r = in_r + anns_t            # (na, nn, 1, 1)
+        r2_4d = r2.unsqueeze(1)          # (1, 1, ch, cw)
+        ann_masks = (r2_4d >= (in_r ** 2)) & (r2_4d <= (out_r ** 2)) & finite_mask.unsqueeze(1)
+
+        # Robust sky background via median over annulus
+        vals = torch.where(ann_masks, cutout.view(1, 1, *cutout.shape), nan_val)
+        bg_grid = torch.nanmedian(vals.flatten(start_dim=2), dim=2).values
+        bg_grid = torch.nan_to_num(bg_grid, nan=0.0)
+
+        # Final background-subtracted aperture flux
+        flux_grid = raw_sums.unsqueeze(1) - bg_grid * mask_areas.unsqueeze(1)
+
+        results.append((flux_grid.cpu().numpy(), bg_grid.cpu().numpy()))
+
+    del img_t, aps_t, anns_t, data
     return results
 
 

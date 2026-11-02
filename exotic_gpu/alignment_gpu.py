@@ -331,6 +331,7 @@ def _probe_gpu_tier() -> Dict[str, Any]:
         "min_pixels_per_frame": 40_000,
         "min_stack_for_small_frame": 32,
         "recommended_batch_size": 1,
+        "min_work": 15,
     }
 
     if not _GPU_AVAILABLE:
@@ -372,21 +373,25 @@ def _probe_gpu_tier() -> Dict[str, Any]:
         min_pixels = 65_536
         min_stack = 16
         batch = 8
+        min_work = 25
     elif mem_gb < 11.0:
         tier_name = "mid"
         min_pixels = 16_384
         min_stack = 8
         batch = 16
+        min_work = 15
     elif mem_gb <= 24.0:
         tier_name = "high"
         min_pixels = 8_192
         min_stack = 4
         batch = 32
+        min_work = 10
     else:
         tier_name = "extreme"
         min_pixels = 4_096
         min_stack = 2
         batch = 64
+        min_work = 6
 
     tier.update(
         name=name,
@@ -395,6 +400,7 @@ def _probe_gpu_tier() -> Dict[str, Any]:
         min_pixels_per_frame=min_pixels,
         min_stack_for_small_frame=min_stack,
         recommended_batch_size=batch,
+        min_work=min_work,
     )
     _GPU_TIER_CACHE = tier
     return tier
