@@ -56,6 +56,7 @@ from astropy.utils.exceptions import AstropyDeprecationWarning
 warnings.simplefilter('ignore', category=AstropyDeprecationWarning)
 
 # standard imports
+import os
 import argparse
 import hashlib
 from time import sleep
