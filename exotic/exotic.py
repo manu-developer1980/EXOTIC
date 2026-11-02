@@ -2736,8 +2736,9 @@ def main():
                                     x_ref = psf_data[ckey][:, 0]
                                     y_ref = psf_data[ckey][:, 1]
                                 else:
-                                    x_ref = None
-                                    y_ref = None
+                                    fallback_ckey = "comp1" if "comp1" in psf_data else list(psf_data.keys())[0]
+                                    x_ref = psf_data[fallback_ckey][:, 0]
+                                    y_ref = psf_data[fallback_ckey][:, 1]
                                 centroid_positions.update(
                                     x_targ=psf_data["target"][:, 0],
                                     y_targ=psf_data["target"][:, 1],
@@ -2903,10 +2904,15 @@ def main():
             goodNormUnc = goodNormUnc[si][gi]
             goodAirmasses = best_fit_lc.airmass
 
+            x_ref_arr = centroid_positions.get('x_ref')
+            y_ref_arr = centroid_positions.get('y_ref')
+            x_ref_val = x_ref_arr[si][gi] if x_ref_arr is not None else np.zeros(len(goodTimes))
+            y_ref_val = y_ref_arr[si][gi] if y_ref_arr is not None else np.zeros(len(goodTimes))
+
             centroid_positions.update(x_targ=centroid_positions['x_targ'][si][gi],
                                       y_targ=centroid_positions['y_targ'][si][gi],
-                                      x_ref=centroid_positions['x_ref'][si][gi],
-                                      y_ref=centroid_positions['y_ref'][si][gi])
+                                      x_ref=x_ref_val,
+                                      y_ref=y_ref_val)
 
             flux_values.update(flux_tar=flux_values['flux_tar'][si][gi],
                                flux_ref=flux_values['flux_ref'][si][gi],
